@@ -4,7 +4,7 @@ import axios from 'axios';
 import { app, BrowserWindow} from 'electron';
 import { ModelExtractor } from './modelExtractor';
 import { logger } from './logger';
-import { PATHS, VS_MLRT_VERSION } from './constants';
+import { PATHS, VS_MLRT_VERSION, DEPENDENCY_VERSIONS } from './constants';
 import { runCommand, getBundledBasePath } from './utils';
 import { FFmpegManager } from './ffmpegManager';
 import { configManager } from './configManager';
@@ -267,10 +267,34 @@ export class DependencyManager {
       }
     }
 
+    // Check dependency versions — if outdated, trigger setup for selective update
+    if (coreDepsPresent) {
+      if (await this.areDependenciesOutdated()) {
+        logger.dependency('Dependency versions mismatch — triggering setup');
+        return false;
+      }
+    }
+
     const allPresent = coreDepsPresent;
     logger.dependency(`All dependencies present: ${allPresent}`);
     
     return allPresent;
+  }
+
+  private async areDependenciesOutdated(): Promise<boolean> {
+    const stored = configManager.getDependencyVersions();
+    if (!stored) {
+      logger.dependency('No dependency version manifest found');
+      return true;
+    }
+
+    for (const [name, version] of Object.entries(DEPENDENCY_VERSIONS)) {
+      if (stored[name] !== version) {
+        logger.dependency(`Dependency "${name}" outdated: ${stored[name] ?? 'none'} → ${version}`);
+        return true;
+      }
+    }
+    return false;
   }
   
   async downloadFile(url: string, outputPath: string, componentName: string): Promise<void> {
@@ -429,30 +453,61 @@ export class DependencyManager {
       logger.dependency(`=== CUDA DETECTION RESULT: ${hasCuda} ===`);
       logger.dependency(`Will ${hasCuda ? 'DOWNLOAD' : 'SKIP'} TensorRT plugin`);
       
-      // Component configurations (non-vs-mlrt components)
-      const components: ComponentConfig[] = [
+      // Get stored dependency versions for selective update
+      const storedVersions = configManager.getDependencyVersions() ?? {};
+
+      // Component configurations with version tracking
+      const versionedComponents: (ComponentConfig & { key: string; dedicatedDir: boolean })[] = [
         {
+          key: 'vapoursynth',
           name: 'VapourSynth R72',
           url: 'https://github.com/vapoursynth/vapoursynth/releases/download/R72/VapourSynth64-Portable-R72.zip',
           archiveName: 'vs-portable.zip',
           checkPath: PATHS.VSPIPE,
-          extractTo: PATHS.VS
+          extractTo: PATHS.VS,
+          dedicatedDir: true
         },
         {
+          key: 'bestsource',
           name: 'BestSource R13',
           url: 'https://github.com/vapoursynth/bestsource/releases/download/R13/BestSource-R13.7z',
           archiveName: 'bestsource.7z',
           checkPath: path.join(PATHS.PLUGINS, 'bestsource.dll'),
-          extractTo: PATHS.PLUGINS
+          extractTo: PATHS.PLUGINS,
+          dedicatedDir: false  // shared plugins dir
         },
         {
+          key: 'video-compare',
           name: 'Video Compare Tool',
           url: 'https://github.com/pixop/video-compare/releases/download/20250928/video-compare-20250928-win10-x86_64.zip',
           archiveName: 'video-compare.zip',
           checkPath: PATHS.VIDEO_COMPARE_EXE,
-          extractTo: PATHS.VIDEO_COMPARE
+          extractTo: PATHS.VIDEO_COMPARE,
+          dedicatedDir: true
         }
       ];
+
+      // Install standard components with version awareness
+      for (const component of versionedComponents) {
+        const isInstalled = await fs.pathExists(component.checkPath);
+        const isOutdated = storedVersions[component.key] !== DEPENDENCY_VERSIONS[component.key];
+
+        if (isInstalled && !isOutdated) {
+          logger.dependency(`${component.name} already up to date`);
+          continue;
+        }
+
+        if (isInstalled && isOutdated) {
+          logger.dependency(`${component.name} outdated — cleaning for update`);
+          if (component.dedicatedDir) {
+            await fs.remove(component.extractTo);
+          } else {
+            await fs.remove(component.checkPath);
+          }
+        }
+
+        await this.downloadAndInstallComponent(component);
+      }
 
       // Check for vs-mlrt version change before installation
       const storedVsMlrtVersion = configManager.getVsMlrtVersion();
@@ -463,15 +518,17 @@ export class DependencyManager {
         logger.dependency('User will be notified to rebuild TensorRT engines');
       }
 
-      // Install standard components
-      for (const component of components) {
-        await this.downloadAndInstallComponent(component);
-      }
-
       // Install vs-mlrt components using the unified manager
       // ONNX Runtime (always needed)
-      if (!(await VsMlrtManager.isComponentInstalled('onnx-runtime'))) {
-        logger.dependency('Installing vs-mlrt ONNX Runtime');
+      const vsMlrtOutdated = storedVersions['vs-mlrt'] !== DEPENDENCY_VERSIONS['vs-mlrt'];
+      const vsMlrtInstalled = await VsMlrtManager.isComponentInstalled('onnx-runtime');
+
+      if (vsMlrtInstalled && !vsMlrtOutdated) {
+        logger.dependency('vs-mlrt ONNX Runtime already up to date');
+      } else {
+        if (vsMlrtInstalled && vsMlrtOutdated) {
+          logger.dependency('vs-mlrt ONNX Runtime outdated — reinstalling');
+        }
         await VsMlrtManager.downloadAndInstall('onnx-runtime', (progress) => {
           this.sendProgress({
             type: 'download',
@@ -480,8 +537,6 @@ export class DependencyManager {
             message: progress.message
           });
         });
-      } else {
-        logger.dependency('vs-mlrt ONNX Runtime already installed');
       }
 
       // TensorRT (only if CUDA is available)
@@ -516,8 +571,19 @@ export class DependencyManager {
       // The version is only updated after the user acknowledges the notification or
       // clears their engines, ensuring they are informed of the change.
       
-      // Setup embedded Python
-      await this.setupEmbeddedPython();
+      // Setup embedded Python (version-aware)
+      const pythonOutdated = storedVersions.python !== DEPENDENCY_VERSIONS.python;
+      const pythonInstalled = await fs.pathExists(PATHS.PYTHON);
+
+      if (pythonInstalled && !pythonOutdated) {
+        logger.dependency('Embedded Python already up to date');
+      } else {
+        if (pythonInstalled && pythonOutdated) {
+          logger.dependency('Embedded Python outdated — clearing for reinstall');
+          await fs.remove(PATHS.PYTHON);
+        }
+        await this.setupEmbeddedPython();
+      }
       
       // Extract bundled ONNX models to AppData
       if (await this.modelExtractor.needsExtraction()) {
@@ -534,9 +600,17 @@ export class DependencyManager {
         logger.dependency('ONNX models already extracted');
       }
 
-      // Install FFmpeg if not present
-      if (!(await FFmpegManager.isInstalled())) {
-        logger.dependency('Installing standalone FFmpeg');
+      // Install FFmpeg (version-aware)
+      const ffmpegOutdated = storedVersions.ffmpeg !== DEPENDENCY_VERSIONS.ffmpeg;
+      const ffmpegInstalled = await FFmpegManager.isInstalled();
+
+      if (ffmpegInstalled && !ffmpegOutdated) {
+        logger.dependency('FFmpeg already up to date');
+      } else {
+        if (ffmpegInstalled && ffmpegOutdated) {
+          logger.dependency('FFmpeg outdated — clearing for reinstall');
+          await FFmpegManager.uninstall();
+        }
         await FFmpegManager.install((message, progress) => {
           this.sendProgress({
             type: 'download',
@@ -545,8 +619,6 @@ export class DependencyManager {
             message
           });
         });
-      } else {
-        logger.dependency('FFmpeg already installed');
       }
 
       // Plugin install runs after this method returns, orchestrated by the
@@ -555,6 +627,10 @@ export class DependencyManager {
 
       // Initialize user config files
       await this.initializeUserConfig();
+
+      // Persist dependency versions after successful setup
+      await configManager.setDependencyVersions({ ...DEPENDENCY_VERSIONS });
+      logger.dependency('Dependency versions persisted');
 
       logger.dependency('All dependencies setup completed successfully');
       logger.separator();

@@ -1,7 +1,7 @@
 // electron/configManager.ts
 import * as fs from 'fs-extra';
 import * as path from 'path';
-import { PATHS } from './constants';
+import { PATHS, DEPENDENCY_VERSIONS } from './constants';
 import { logger } from './logger';
 import { getBundledBasePath } from './utils';
 import type { ModelType } from './scriptGenerator';
@@ -45,6 +45,7 @@ interface AppConfig {
   encodingSettingsExpanded?: boolean;
   vsMlrtVersion?: string;
   appVersion?: string;
+  dependencyVersions?: Record<string, string>;
   models: {
     [modelName: string]: {
       useFp32: boolean;
@@ -104,6 +105,22 @@ export class ConfigManager {
       } else {
         logger.info('No config file found, using defaults (will be created during setup)');
         // Don't save here - let initializeUserConfig() copy the stock config with pre-packed models
+      }
+
+      // Seed dependency versions for existing users upgrading from before version tracking
+      if (this.config.appVersion && !this.config.dependencyVersions) {
+        // All releases to date (0.12.0 – 0.16.1) ship with these dependency versions.
+        // This avoids a full re-download on first upgrade.
+        this.config.dependencyVersions = {
+          vapoursynth: 'R72',
+          bestsource: 'R13',
+          'vs-mlrt': '15.13',
+          python: '3.13.0',
+          'video-compare': '20250928',
+          ffmpeg: 'git-2025',
+        };
+        // Extend this chain when deps change in future releases
+        await this.save();
       }
     } catch (error) {
       logger.error('Error loading config:', error);
@@ -467,6 +484,15 @@ export class ConfigManager {
 
   async setAppVersion(version: string): Promise<void> {
     this.config.appVersion = version;
+    await this.save();
+  }
+
+  getDependencyVersions(): Record<string, string> | undefined {
+    return this.config.dependencyVersions;
+  }
+
+  async setDependencyVersions(versions: Record<string, string>): Promise<void> {
+    this.config.dependencyVersions = { ...versions };
     await this.save();
   }
 }

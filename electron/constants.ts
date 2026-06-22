@@ -4,6 +4,16 @@ import { app } from 'electron';
 // Current vs-mlrt TensorRT version - update this when upgrading vs-mlrt
 export const VS_MLRT_VERSION = '15.13';
 
+// Dependency versions — bump these when upgrading bundled deps
+export const DEPENDENCY_VERSIONS: Record<string, string> = {
+  vapoursynth: 'R72',
+  bestsource: 'R13',
+  'vs-mlrt': '15.13',
+  python: '3.13.0',
+  'video-compare': '20250928',
+  ffmpeg: 'git-2025',
+} as const;
+
 // Use portable path relative to the executable location
 // In development: uses the project directory
 // In production: uses the directory where the .exe is located
